@@ -8,21 +8,29 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 use_vpi = True
+use_udpsrc = True
 
 VIDEO_LOCATION = "\"/home/oomii/Downloads/gravity_2k-trailer/Gravity - 2K Trailer.mp4\""
-W, H = 2048, 858
 
-get_frame_elements = [
-    "filesrc location={}".format(VIDEO_LOCATION), "qtdemux",
-    # "udpsrc port=7001", "application/x-rtp", "rtph264depay", 
+
+gst_src = []
+if use_udpsrc:
+    gst_src = ["udpsrc port=7001", "application/x-rtp", "rtph264depay"]
+    W, H = 1024, 600
+else:
+    gst_src = [f"filesrc location={VIDEO_LOCATION}", "qtdemux"]
+    W, H = 2048, 858
+    
+get_frame_elements = gst_src + [
     "queue", "h264parse", "nvv4l2decoder", "nvvidconv",
+    "videorate", 
     f"video/x-raw,format=RGBA, width={W}, height={H}",
-    "appsink sync=true emit-signals=true"
+    f"appsink name=appsink0 sync={'false' if use_udpsrc else 'true'} emit-signals=true"
 ]
 
 display_elements = [
-    "appsrc","queue max-size-time=100",
-    f"video/x-raw,format=RGBA,width={W},height={H},framerate=30/1",
+    "appsrc",
+    f"video/x-raw,format=RGBA,width={W},height={H},framerate=10/1",
     "nvvidconv",
     "nvoverlaysink display-id=0 sync=false"]
 
@@ -102,7 +110,6 @@ appsrc = display_pipeline.get_by_name("appsrc0")
 
 frame_count = 0
 
-# grid = vpi.WarpGrid(input.size)
 try:
     while True:
         frame = get_frame(appsink)
