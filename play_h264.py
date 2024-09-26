@@ -8,6 +8,7 @@ from gi.repository import Gst
 
 VIDEO_LOCATION = "\"/home/oomii/Downloads/gravity_2k-trailer/Gravity - 2K Trailer.mp4\""
 DECODE_ELEMENTS = ["h264parse", "queue", "nvv4l2decoder", "nvvidconv", "video/x-raw, format=RGBA"]
+CORRECTION_X = np.eye(3, 4)
 
 class jetson_video_bridge():
     def __init__(self, id, port=None):
@@ -45,11 +46,8 @@ class jetson_video_bridge():
         
         K = [[f, 0, self.W/2],
             [0, f, self.H/2]]
-        X = np.eye(3, 4)
-        f = focalLength * self.W / sensorWidth
-        self.warp = vpi.WarpMap.fisheye_correction(grid, K=K, X=X,
-                                            mapping=vpi.FisheyeMapping.EQUIDISTANT,
-                                            coeffs=[-0.1, 0.004])
+        
+        self.warp = vpi.WarpMap.polynomial_correction(grid, K=K, X=CORRECTION_X, rcoeffs=[-0.1, 0.004])
         
     def set_pipelines_state(self, state):
         self.get_frame_pipeline.set_state(state)
