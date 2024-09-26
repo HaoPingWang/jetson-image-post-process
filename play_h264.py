@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-#import pycuda.driver as cuda
 import vpi
 import numpy as np
 
@@ -7,124 +6,123 @@ import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
-use_vpi = True
-use_udpsrc = True
-
 VIDEO_LOCATION = "\"/home/oomii/Downloads/gravity_2k-trailer/Gravity - 2K Trailer.mp4\""
+DECODE_ELEMENTS = ["h264parse", "queue", "nvv4l2decoder", "nvvidconv", "video/x-raw, format=RGBA"]
 
+class jetson_video_bridge():
+    def __init__(self, id, port=None):
+        self.frame = None
+        if not port:
+            self.W, self.H = 2048, 858
+            sync = True
+            gst_src = [f"filesrc location={VIDEO_LOCATION}", "qtdemux"]
+        else:
+            self.W, self.H = 1024, 600
+            sync = False
+            gst_src = [f"udpsrc port={port}", "application/x-rtp", "rtph264depay"]
+            
+        get_frame_elements = gst_src + DECODE_ELEMENTS
+        get_frame_elements += ["queue", f"appsink name=appsink{id} sync={sync} emit-signals=true"]
 
-gst_src = []
-if use_udpsrc:
-    gst_src = ["udpsrc port=7001", "application/x-rtp", "rtph264depay"]
-    W, H = 1024, 600
-else:
-    gst_src = [f"filesrc location={VIDEO_LOCATION}", "qtdemux"]
-    W, H = 2048, 858
-    
-get_frame_elements = gst_src + [
-    "queue", "h264parse", "nvv4l2decoder", "nvvidconv",
-    "videorate", 
-    f"video/x-raw,format=RGBA, width={W}, height={H}",
-    f"appsink name=appsink0 sync={'false' if use_udpsrc else 'true'} emit-signals=true"
-]
+        display_elements = [
+            f"appsrc name=appsrc{id}",
+            f"video/x-raw, format=RGBA, height={self.H}, width={self.W}, framerate=30/1",
+            f"nvvidconv", f"nvoverlaysink name=nvoverlaysink{id} display-id={id} sync=false"
+        ]
 
-display_elements = [
-    "appsrc",
-    f"video/x-raw,format=RGBA,width={W},height={H},framerate=10/1",
-    "nvvidconv",
-    "nvoverlaysink display-id=0 sync=false"]
+        self.get_frame_pipeline = Gst.parse_launch(" ! ".join(get_frame_elements))
+        self.display_pipeline = Gst.parse_launch(" ! ".join(display_elements))
 
+        self.appsink = self.get_frame_pipeline.get_by_name(f"appsink{id}")
+        self.appsrc = self.display_pipeline.get_by_name(f"appsrc{id}")
 
-def get_frame(appsink):
-    sample = appsink.emit('pull-sample')
-    if not sample:
-        return
-    
-    buf = sample.get_buffer()
-    caps = sample.get_caps()
-    width = caps.get_structure(0).get_value('width')
-    height = caps.get_structure(0).get_value('height')
+        self.set_pipelines_state(Gst.State.PLAYING)
+        
+        grid = vpi.WarpGrid((self.W, self.H))
+        sensorWidth = 22.2 # APS-C sensor
+        focalLength = 7.5
+        f = focalLength * self.W / sensorWidth
+        
+        K = [[f, 0, self.W/2],
+            [0, f, self.H/2]]
+        X = np.eye(3, 4)
+        f = focalLength * self.W / sensorWidth
+        self.warp = vpi.WarpMap.fisheye_correction(grid, K=K, X=X,
+                                            mapping=vpi.FisheyeMapping.EQUIDISTANT,
+                                            coeffs=[-0.1, 0.004])
+        
+    def set_pipelines_state(self, state):
+        self.get_frame_pipeline.set_state(state)
+        self.display_pipeline.set_state(state)
 
-    # 获取缓冲区中的数据
-    success, map_info = buf.map(Gst.MapFlags.READ)
+    def get_frame(self):
+        # 清空 appsink 的緩衝區
+        while self.appsink.emit('try-pull-sample', 0):
+            pass
+        
+        sample = self.appsink.emit('pull-sample')
+        if not sample:
+            return
+        
+        caps = sample.get_caps()
+        w = caps.get_structure(0).get_value('width')
+        h = caps.get_structure(0).get_value('height')
+        buf = sample.get_buffer()
+        success, map_info = buf.map(Gst.MapFlags.READ)  # 获取缓冲区中的数据
 
-    arr = np.ndarray(
-        (height, width, 4),
-        dtype=np.uint8,
-        buffer=map_info.data
-    )
-    # 解除映射缓冲区
-    buf.unmap(map_info)
-    return arr
+        self.frame = np.ndarray((h, w, 4), dtype=np.uint8, buffer=map_info.data)
+        buf.unmap(map_info)  # 解除映射缓冲区
 
-def display_vpi_image(frame: vpi.Image, src):
-    # 将 NumPy 数组转换为 GStreamer 缓冲区
-    buffer = Gst.Buffer.new_allocate(None, W*H*4, None)
-    if type(frame) == vpi.Image:
-        with frame.lock():
-            # frame.nbytes = 2457600
-            frame = frame.cpu()
+    def display_vpi_image(self):        
+        # 将 NumPy 数组转换为 GStreamer 缓冲区
+        buffer = Gst.Buffer.new_allocate(None, self.frame.shape[0]*self.frame.shape[1]*4, None)    
+        buffer.fill(0, self.frame.tobytes())
+        
+        # 设置缓冲区的时间戳
+        buffer.pts = Gst.util_uint64_scale(Gst.CLOCK_TIME_NONE, 1, 1)
+        buffer.duration = Gst.util_uint64_scale(Gst.CLOCK_TIME_NONE, 1, 1)
 
-    buffer.fill(0, frame.tobytes())
-    # 设置缓冲区的时间戳
-    buffer.pts = Gst.util_uint64_scale(Gst.CLOCK_TIME_NONE, 1, 1)
-    buffer.duration = Gst.util_uint64_scale(Gst.CLOCK_TIME_NONE, 1, 1)
-
-    # 推送缓冲区到 src
-    ret = src.emit('push-buffer', buffer)
-    if ret != Gst.FlowReturn.OK:
-        print("Error pushing buffer to src")
-
-
-def correct_distortion(frame):
-    input = vpi.asimage(frame)
+        # 推送缓冲区到 src
+        ret = self.appsrc.emit('push-buffer', buffer)
+        if ret != Gst.FlowReturn.OK:
+            print("Error pushing buffer to src")
+        
+def correct_distortion(frame, warp):
     with vpi.Backend.CUDA:
-        output = input.remap(warp, interp=vpi.Interp.CATMULL_ROM, border=vpi.Border.ZERO)
+        vpi_image = vpi.asimage(frame).convert(vpi.Format.NV12_ER)
+        vpi_image = vpi_image.remap(warp, interp=vpi.Interp.CATMULL_ROM, border=vpi.Border.ZERO)
+        vpi_image = vpi_image.convert(vpi.Format.RGBA8)
     
-    return output
+    with vpi_image.lock():
+        frame = vpi_image.cpu()
 
-grid = vpi.WarpGrid((W, H))
-sensorWidth = 22.2 # APS-C sensor
-focalLength = 7.5
-f = focalLength * W / sensorWidth
- 
-K = [[f, 0, W/2],
-     [0, f, H/2]]
-X = np.eye(3,4)
-f = focalLength * W / sensorWidth
-warp = vpi.WarpMap.fisheye_correction(grid, K=K, X=X,
-                                      mapping=vpi.FisheyeMapping.EQUIDISTANT,
-                                      coeffs=[-0.1, 0.004])
- 
-# 初始化GStreamer
-Gst.init(None)
+    return frame
 
-get_frame_pipeline = Gst.parse_launch(" ! ".join(get_frame_elements))
-display_pipeline = Gst.parse_launch(" ! ".join(display_elements))
-
-get_frame_pipeline.set_state(Gst.State.PLAYING)
-display_pipeline.set_state(Gst.State.PLAYING)
-
-appsink = get_frame_pipeline.get_by_name("appsink0")
-appsrc = display_pipeline.get_by_name("appsrc0")
-
-frame_count = 0
 
 try:
+    # 初始化GStreamer
+    Gst.init(None)
+    left = jetson_video_bridge(0, 7001)
+    right = jetson_video_bridge(1)
+
+    left.set_pipelines_state(Gst.State.PLAYING)
+    right.set_pipelines_state(Gst.State.PLAYING)
+
+    frame_count = 0
+
     while True:
-        frame = get_frame(appsink)
-        if frame is None:
-            print("No frame")
-            break
+        left.get_frame()
+        right.get_frame()
 
         frame_count += 1
-        if use_vpi:
-            frame = correct_distortion(frame)  # 进行 VPI 畸变校正
-
-        display_vpi_image(frame, appsrc)
+        # print(f"Frame count: {frame_count}")
+        left.frame = correct_distortion(left.frame, left.warp)
+        right.frame = correct_distortion(right.frame, right.warp)
+        left.display_vpi_image()
+        right.display_vpi_image()
 
 # ctrl + c 退出
-except KeyboardInterrupt:
+finally:
     print("Terminating process")
-    get_frame_pipeline.set_state(Gst.State.NULL)
-    display_pipeline.set_state(Gst.State.NULL)
+    left.set_pipelines_state(Gst.State.NULL)
+    right.set_pipelines_state(Gst.State.NULL)
